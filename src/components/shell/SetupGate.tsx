@@ -9,7 +9,12 @@ import { importBackup } from '@/lib/backup';
 import { KInput, KTextarea } from '@/components/ui/Kit';
 import { fileDrop } from '@/lib/dnd';
 import {
-  saveLocalConfig, configFileText, validateConfig, serverConfig, parseFirebaseSnippet,
+  saveLocalConfig,
+  configFileText,
+  validateConfig,
+  serverConfig,
+  loadServerConfig,
+  parseFirebaseSnippet,
 } from '@/lib/serverConfig';
 import type { BackendConfig, BackendKind } from '@/lib/backend/types';
 import { createBackend } from '@/lib/backend';
@@ -55,11 +60,27 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
     return m ? `https://github.com/${m[1]}/${m[2]}/upload/main/public` : '';
   })();
 
-  useEffect(() => {
-    if (serverConfig() || isSetupDone()) { setReady(true); return; }
+ useEffect(() => {
+  let alive = true;
+
+  (async () => {
+    const config = await loadServerConfig();
+
+    if (!alive) return;
+
+    if (config || isSetupDone()) {
+      setReady(true);
+      return;
+    }
+
     setNeed(true);
     setReady(true);
-  }, []);
+  })();
+
+  return () => {
+    alive = false;
+  };
+}, []);
 
   if (!ready) return null;
   if (!need) return <>{children}</>;
