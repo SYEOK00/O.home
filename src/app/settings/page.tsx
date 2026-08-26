@@ -1,7 +1,7 @@
 ﻿'use client';
 // 환경설정 (기획서 5장) — 0차: 「디자인」 탭(테마) 실동작.
 // 나머지 카테고리는 해당 기능 마일스톤에서 함께 구현.
-import React, { Suspense, useEffect, useRef, useState } from 'react';
+import React, { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth, inviteCode, setInviteCode } from '@/lib/auth';
 import { useMembers } from '@/lib/members';
 import { useTheme } from '@/lib/ThemeProvider';
@@ -16,18 +16,20 @@ import { DiaryPost, DIARY_SEED } from '@/lib/diaryStore';
 import { newId } from '@/lib/postStore';
 import { useCommSettings, badgeStyle, CommBadge, CommSettings } from '@/lib/commStore';
 import {
-  useBoardSettings, boardBadgeStyle, BoardBadge,
+  useBoardSettings, boardBadgeStyle, BoardBadge, galleryCatsOf,
   useBoards, Board, BoardSkin, BoardPerm, DEFAULT_BOARD_CATS, MAIN_BOARD_ID,
 } from '@/lib/boardStore';
-import { useThreadSettings, ThreadWork, THREAD_SEED, ThreadCat, threadBadgeStyle } from '@/lib/threadStore';
+import { useThreadSettings, ThreadWork, THREAD_SEED, ThreadCat, threadBadgeStyle, threadCats, threadCatsPatch } from '@/lib/threadStore';
 import { useTrpgSettings, DOTORI_STATUS_KEYS, DotoriStatus, dotoriBadgeStyle } from '@/lib/galleryStore';
 import { useMemoSettings } from '@/lib/memoStore';
 import {
   useMenuSettings, MenuSettings, MenuPerm, MenuVis, PLAYLOG_COLS,
-  MenuGroupNode, MenuLeaf, defaultTree, newGroupId, menuLabelFor, extraBoardHref,
+  MenuGroupNode, MenuLeaf, defaultTree, newGroupId, menuLabelFor, extraBoardHref, boardEntries,
   IMG_PROTECT_AREAS,
 } from '@/lib/menuStore';
 import { FEATURES } from '@/lib/menu';
+import { SectionsBlock } from '@/components/settings/SectionList';
+import { useSections, sectionMenuEntries, MAIN_SEC, inSection } from '@/lib/sectionStore';
 import { useSiteDraft } from '@/lib/siteStore';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useCursorSettings, CursorState, CURSOR_STATE_LABEL } from '@/lib/cursorStore';
@@ -36,6 +38,7 @@ import { SymbolInput } from '@/components/ui/SymbolInput';
 import { allBlobs, putBlobAs, useBlobUrl, getBlob } from '@/lib/blobStore';
 import { parseAni } from '@/lib/aniCursor';
 import { fileDrop } from '@/lib/dnd';
+import { Character, CHAR_SEED, Relation, REL_SEED } from '@/lib/charStore';
 import { useLocalList } from '@/lib/postStore';
 import { Mood, MOOD_SEED, moodTint } from '@/lib/diaryStore';
 import {
@@ -49,6 +52,8 @@ import { putBlob } from '@/lib/blobStore';
 import { getSetting, setSetting, pushLocalSettings, unsyncedSettingKeys, SETTING_KEYS } from '@/lib/settingStore';
 import { isServerMode, createBackend, backend } from '@/lib/backend';
 import type { BackendConfig, BackendKind } from '@/lib/backend/types';
+import { CONTENT_COLLECTIONS } from '@/lib/backend/types';
+import { visFloorOf } from '@/lib/visFloor';
 import { validateConfig, configFileText, saveLocalConfig, parseFirebaseSnippet, serverConfig } from '@/lib/serverConfig';
 import { migrateTo, findOrphanFiles } from '@/lib/transfer';
 import { FIRESTORE_RULES, STORAGE_RULES } from '@/lib/firebaseRules';
@@ -67,6 +72,36 @@ function CP({ label, k, def }: { label?: string; k: keyof ThemeVars; def?: strin
       {label && <span className="cp-lb">{label}</span>}
       <ColorField value={String(state.vars[k] ?? def ?? '#888888')} onChange={hex => setVar(k, hex as never)} />
     </>
+  );
+}
+
+/**
+ * 위젯 스타일 (v2.0 사용자 요청) — 메인·사이드에 얹히는 카드의 배경·타이틀색·본문색·테두리.
+ *
+ * 색을 안 정하면 `--wg-*`가 카드 색을 그대로 가리키므로 지금까지와 똑같이 보인다. 그래서 값이
+ * 비어 있을 때 입력란에는 **지금 실제로 쓰이는 카드 색**을 채워 둔다 — 처음 열었을 때 엉뚱한
+ * 회색이 아니라 화면에 보이는 그 색이 나와야 조금만 바꿔 쓰기 쉽다.
+ * 테두리는 켤 때만 그린다(끄면 지금처럼 그림자만).
+ */
+function WidgetStyleRow() {
+  const { state, setVar } = useTheme();
+  const v = state.vars;
+  return (
+    <div className="set-row" style={{ flexWrap: 'wrap' }}>
+      <div className="l"><b>위젯</b>
+        <small>메인·사이드에 얹히는 카드 — 비워 두면 카드 색을 그대로 따라갑니다</small></div>
+      <div style={{ display: 'grid', gap: 8, justifyItems: 'end' }}>
+        <div className="cp-grid2">
+          <CP label="배경" k="wgBg" def={v.cardBg ?? '#fbfbfc'} />
+          <CP label="타이틀" k="wgTitle" def={v.pageDesc ?? '#8a8f98'} />
+          <CP label="본문" k="wgFg" def={v.cardFg ?? '#1d2025'} />
+        </div>
+        <div className="cf-row" style={{ justifyContent: 'flex-end' }}>
+          <KCheck label="테두리" checked={!!v.wgBorder} onChange={b => setVar('wgBorder', b)} />
+          {v.wgBorder && <CP label="색" k="wgBd" def="#e6e8ec" />}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -276,6 +311,12 @@ function DesignPane() {
         <DocTitleControl />
       </div>
 
+      {/* 브라우저 탭 아이콘 (v2.0 사용자 요청) — 지정 전에는 배포 기본 아이콘이 뜬다 */}
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l"><b>브라우저 탭 아이콘</b><small>탭·즐겨찾기에 표시되는 작은 그림 — 정사각형 PNG 권장, 비우면 기본 아이콘</small></div>
+        <FaviconControl />
+      </div>
+
       <div className="set-row" style={{ flexWrap: 'wrap' }}>
         <div className="l"><b>크롤링 설명 문구</b><small>카톡·디스코드 등에 링크 공유 시 제목 아래 뜨는 한 줄 — 비우면 서브타이틀, 그것도 비었으면 기본 문구</small></div>
         <CrawlDescControl />
@@ -426,6 +467,9 @@ function DesignPane() {
           <CP label="글씨" k="segFg" />
         </div>
       </div>
+
+      {/* 위젯 스타일 (v2.0 사용자 요청) — 메인·사이드 카드. 안 정하면 카드 색을 그대로 따라간다 */}
+      <WidgetStyleRow />
 
       <div className="set-row">
         <div className="l"><b>진한 버튼</b><small>등록·저장 버튼과 체크박스·선택 필터 칩 공통</small></div>
@@ -609,6 +653,13 @@ function BoardPane() {
   } = useBoardSettings();
   const { boards, setBoards, patchBoard } = useBoards();
   const [catBoard, setCatBoard] = useState(MAIN_BOARD_ID);   // 말머리 편집 대상 게시판
+  /* 갤러리 말머리도 갤러리마다 따로 (v2.0 사용자 요청) — 어느 갤러리 것을 고칠지 고른다.
+     하나뿐이면 고를 것이 없으니 선택 줄을 아예 두지 않는다 (감상타래와 같은 방식) */
+  const { list: secList } = useSections();
+  const galSecs = secList('gallery');
+  const [galSecSel, setGalSec] = useState(MAIN_SEC);
+  const galSec = galSecs.some(s2 => s2.id === galSecSel) ? galSecSel : MAIN_SEC;
+  const galCats = galleryCatsOf(st, galSec);
   const del = useConfirmDelete();
 
   const sel = boards.find(b => b.id === catBoard) ?? boards[0];
@@ -737,10 +788,21 @@ function BoardPane() {
         </div>
       ))}
 
-      {/* 갤러리 말머리 (v2.0 사용자 요청) — 예전에는 코드에 박혀 있어 바꿀 수 없었다 */}
+      {/* 갤러리 말머리 (v2.0 사용자 요청) — 예전에는 코드에 박혀 있어 바꿀 수 없었다.
+          여러 개로 만든 갤러리마다 따로 정한다 (v2.0 사용자 요청) */}
       <h3 style={{ marginTop: 20 }}>갤러리 말머리</h3>
-      <div className="d">그림백업 글쓰기에서 고르는 말머리 — ⠿ 드래그로 순서 · 추가·수정·삭제 자유</div>
-      <DragList items={st.galleryCats} keyOf={c => c.id} onReorder={setGalleryCats}
+      <div className="d">
+        그림백업 글쓰기에서 고르는 말머리 — ⠿ 드래그로 순서 · 추가·수정·삭제 자유
+        {galSecs.length > 1 && <><br />갤러리마다 따로 정합니다 — <b>손대기 전까지는 기본 갤러리의 말머리를 그대로 씁니다</b></>}
+      </div>
+      {galSecs.length > 1 && (
+        <div className="mini-seg" style={{ flexWrap: 'wrap', marginBottom: 10 }}>
+          {galSecs.map(s2 => (
+            <button key={s2.id} className={galSec === s2.id ? 'on' : ''} onClick={() => setGalSec(s2.id)}>{s2.name}</button>
+          ))}
+        </div>
+      )}
+      <DragList items={galCats} keyOf={c => c.id} onReorder={next => setGalleryCats(galSec, next)}
         render={c => (
           <div className="set-row" style={{ width: '100%' }}>
             <div className="l" style={{ display: 'flex', gap: 11, alignItems: 'center' }}>
@@ -748,18 +810,22 @@ function BoardPane() {
               <span style={boardBadgeStyle(c)}>{c.label || '말머리'}</span>
             </div>
             <div className="cp-group" style={{ justifyContent: 'flex-end' }}>
-              <KInput value={c.label} onChange={e => patchGalleryCat(c.id, { label: e.target.value })}
+              <KInput value={c.label} onChange={e => patchGalleryCat(galSec, c.id, { label: e.target.value })}
                 style={{ width: 100, textAlign: 'right' }} />
-              {colorCells(c, p => patchGalleryCat(c.id, p))}
+              {colorCells(c, p => patchGalleryCat(galSec, c.id, p))}
               <span className="fx" data-tip="말머리 삭제"
                 onClick={() => del.ask(`말머리 「${c.label}」를 삭제하시겠습니까?`,
-                  () => removeGalleryCat(c.id),
+                  () => removeGalleryCat(galSec, c.id),
                   '이미 이 말머리로 등록된 글은 그대로 남습니다.')}>✕</span>
             </div>
           </div>
         )} />
       <button className="btn btn-ghost" style={{ marginTop: 8, padding: '7px 14px', fontSize: 11 }}
-        onClick={addGalleryCat}>＋ 말머리 추가</button>
+        onClick={() => addGalleryCat(galSec)}>＋ 말머리 추가</button>
+
+      <hr style={{ margin: '24px 0', border: 'none', borderTop: '1.5px solid var(--line)' }} />
+      {/* 갤러리·다이어리 등도 여러 개로 (v2.0 사용자 요청) — 목록이 몇 개인지는 여기 한곳에서 */}
+      <SectionsBlock />
 
       {del.element}
     </div>
@@ -1261,6 +1327,45 @@ function CrawlDescControl() {
   );
 }
 
+/** 브라우저 탭 아이콘 (v2.0 사용자 요청) — 지정 전에는 기본 아이콘(배포 기본값)이 뜬다.
+ *  탭 제목 바로 아래에 같은 드래프트/SAVE 흐름으로 둔다. */
+function FaviconControl() {
+  const { site, set } = useSiteDraft();
+  const toast = useToast();
+  const url = useBlobUrl(site.favicon);
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+      <span style={{
+        width: 35, height: 35, borderRadius: 'var(--radius-s)', border: '1px solid var(--line)',
+        background: 'var(--panel)', display: 'grid', placeItems: 'center', overflow: 'hidden', flexShrink: 0,
+      }}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        {url ? <img src={url} alt="" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+          : <span style={{ fontSize: 10, color: 'var(--faint)' }}>기본</span>}
+      </span>
+      <input id="siteFavicon" type="file" accept="image/png,image/x-icon,image/svg+xml,image/webp,.ico"
+        style={{ display: 'none' }}
+        onChange={async e => {
+          const f = e.target.files?.[0];
+          e.target.value = '';
+          if (!f) return;
+          // 올리기가 막히면 아무 말 없이 끝나지 않게 (v2.0 — 프로필 사진에서 겪은 것과 같은 이유)
+          try { set({ favicon: await putBlob(f) }); } catch (err) {
+            toast(`아이콘을 저장소에 올리지 못했습니다 — ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }} />
+      <button className="btn btn-ghost" style={{ height: 35, padding: '0 14px', fontSize: 11 }}
+        onClick={() => document.getElementById('siteFavicon')?.click()}>
+        {site.favicon ? 'CHANGE' : 'UPLOAD'}
+      </button>
+      {site.favicon && (
+        <button className="btn btn-ghost" style={{ height: 35, padding: '0 14px', fontSize: 11 }}
+          onClick={() => set({ favicon: undefined })}>REMOVE</button>
+      )}
+    </div>
+  );
+}
+
 function LogoControls() {
   // 드래프트로만 반영 (v1.9) — 미리보기 즉시, 저장은 디자인 탭 SAVE에서
   const { site, set } = useSiteDraft();
@@ -1423,8 +1528,11 @@ function DataPane() {
       const rows = await findOrphanFiles(be);
       setOrphans(rows);
       toast(rows.length ? `쓰지 않는 이미지 ${rows.length}개를 찾았습니다` : '정리할 이미지가 없습니다');
-    } catch {
-      toast('이미지 목록을 읽지 못했습니다 — 저장소 권한(규칙)을 확인해 주세요');
+    } catch (e) {
+      // 멈춘 이유를 그대로 보여 준다 (v2.0) — 「권한 문제」로 뭉뚱그리면 진짜 원인을 놓친다
+      toast(e instanceof Error && e.message
+        ? e.message
+        : '이미지 목록을 읽지 못했습니다 — 저장소 권한(규칙)을 확인해 주세요');
     }
     setScanning(false);
   };
@@ -1440,6 +1548,25 @@ function DataPane() {
     setOrphans(null);
     setScanning(false);
     toast(`이미지 ${n}개를 지웠습니다`);
+  };
+
+  /* 어디에도 안 걸린 상대 캐릭터 정리 (v2.0 사용자 요청).
+     자관을 지워도 그 자관에서 만든 상대 캐릭터는 남는다. **일부러 그렇게 둔다** — 실수로 자관을
+     지웠을 때 캐릭터까지 사라지면 되돌릴 방법이 없기 때문(사용자 판단). 대신 정말 아무 자관에도
+     안 걸린 것만 골라 여기서 지운다. 내 캐릭터(own)는 자관과 무관하게 존재하므로 건드리지 않는다. */
+  const [chars, setChars] = useLocalList<Character>('ohome.chars.v1', CHAR_SEED);
+  const [rels] = useLocalList<Relation>('ohome.rels.v1', REL_SEED);
+  const [charAsk, setCharAsk] = useState(false);
+  const orphanChars = useMemo(() => {
+    const used = new Set<string>();
+    rels.forEach(r => r.members.forEach(m => used.add(m.charId)));
+    return chars.filter(c => !c.own && !used.has(c.id));
+  }, [chars, rels]);
+
+  const cleanChars = () => {
+    const gone = new Set(orphanChars.map(c => c.id));
+    setChars(chars.filter(c => !gone.has(c.id)));
+    toast(`상대 캐릭터 ${gone.size}명을 지웠습니다`);
   };
 
   // 이 브라우저에 저장돼 있던 사이트 설정을 서버로 올린다 (연결 직후 1회면 충분)
@@ -1584,6 +1711,22 @@ function DataPane() {
           </div>
         </div>
       )}
+      {/* 어디에도 안 걸린 상대 캐릭터 정리 (v2.0 사용자 요청) — 자관을 지워도 캐릭터는 일부러 남긴다.
+          실수로 지웠을 때 되돌릴 수 있게. 정말 안 쓰는 것만 여기서 골라 지운다 */}
+      <div className="set-row" style={{ flexWrap: 'wrap' }}>
+        <div className="l"><b>등록되지 않은 상대 캐릭터 정리</b>
+          <small>자관을 지워도 상대 캐릭터는 남습니다(실수로 지웠을 때를 위해) — 어느 자관에도 없는 캐릭터만 골라 지웁니다</small></div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span className="hint">
+            {orphanChars.length > 0 ? `${orphanChars.length}명` : '정리할 것 없음'}
+          </span>
+          {orphanChars.length > 0 && (
+            <button className="btn btn-accent" style={{ padding: '9px 18px' }}
+              onClick={() => setCharAsk(true)}>{orphanChars.length}명 지우기</button>
+          )}
+        </div>
+      </div>
+
       {/* 백업 두 갈래 (v1.9 사용자 확정) — 회원 계정 포함 여부 선택 */}
       <div className="set-row" style={{ flexWrap: 'wrap' }}>
         <div className="l"><b>백업 내보내기</b><small>글·캐릭터·설정 + 이미지 → zip · 회원 계정(가입자·가입코드) 포함 여부 선택</small></div>
@@ -1733,6 +1876,15 @@ function DataPane() {
           { label: 'CANCEL', kind: 'ghost', onClick: () => setCleanAsk(false) },
         ]} />
 
+      {/* 지울 캐릭터 이름을 그대로 보여 준다 (v2.0) — 개수만으로는 무엇이 사라지는지 알 수 없다 */}
+      <ConfirmModal open={charAsk} title={`상대 캐릭터 ${orphanChars.length}명을 지울까요?`}
+        body={`${orphanChars.slice(0, 12).map(c => c.name).join(', ')}${orphanChars.length > 12 ? ` 외 ${orphanChars.length - 12}명` : ''} — 어느 자관에도 등록돼 있지 않은 캐릭터입니다. 지우면 복구할 수 없습니다.`}
+        onClose={() => setCharAsk(false)}
+        buttons={[
+          { label: '지우기', kind: 'accent', onClick: () => { setCharAsk(false); cleanChars(); } },
+          { label: 'CANCEL', kind: 'ghost', onClick: () => setCharAsk(false) },
+        ]} />
+
       <ConfirmModal open={resetAsk} title="선택한 항목을 초기화할까요?"
         body={`지울 항목: ${[...RESET_CONTENT, ...RESET_EXTRA].filter(g => picked.includes(g.key)).map(g => g.label).join(' · ')}\n삭제한 내용은 복구할 수 없습니다.`}
         onClose={() => setResetAsk(false)}
@@ -1767,12 +1919,19 @@ function DataPane() {
 /** 메뉴 관리 탭 (5.2 — 메뉴 선택제) — 노출·순서·이름 + 메뉴별 부속 설정 */
 function MenuPane() {
   const [ms, patch, msLoaded] = useMenuSettings();
+  // 글에도 적용 (v2.0 사용자 요청) — 아래 applyVis 참조
+  const { user } = useAuth();
+  const [visBusy, setVisBusy] = useState(false);
+  const [visAsk, setVisAsk] = useState(false);
   const [commSet, patchComm] = useCommSettings();
   const { boards, loaded: bLoaded, patchBoard } = useBoards();  // 추가 게시판 이름·자동 편입 동기화 + 권한
   const toast = useToast();
   const del = useConfirmDelete();
   const saved = ms.tree ?? defaultTree();
-  const defLabel = (href: string) => menuLabelFor(href, boards) ?? href;
+  // 게시판 + 여러 개로 만든 섹션 — 메뉴가 아는 「추가 항목」 전체 (v2.0)
+  const { map: secMap } = useSections();
+  const extraAll = [...boardEntries(boards), ...sectionMenuEntries(secMap)];
+  const defLabel = (href: string) => menuLabelFor(href, extraAll) ?? href;
 
   // 드래프트 — 모든 편집(삭제 포함)은 SAVE를 눌러야 실제 메뉴에 반영 (v1.9 사용자 피드백)
   const [draft, setDraft] = useState<MenuGroupNode[] | null>(null);
@@ -1792,6 +1951,29 @@ function MenuPane() {
 
   const setTree = (t: MenuGroupNode[]) => setDraft(t);
   const saveAll = () => { patch({ tree, removedBoards: removed }); toast('메뉴가 저장되었습니다'); };
+
+  /* 이미 올라간 글의 공개범위를 서버에 적용 (v2.0 사용자 요청).
+     화면에서 가리는 것만으로는 API를 직접 부르는 사람에게 그대로 보인다 — 서버(RLS)가
+     내주지 않게 하려면 행의 공개범위 칸 자체가 좁아야 한다.
+     컬렉션을 하나씩 훑어 **비공개 메뉴에 걸린 것만** 골라 그 칸만 갱신한다(내용·순서는 그대로).
+     새 글은 저장할 때마다 같은 기준이 자동으로 걸리므로(visFloor) 이 버튼은 **이미 있는 글**용이다. */
+  const applyVis = async () => {
+    const be = backend();
+    if (!be) { toast('서버에 연결돼 있지 않습니다 — 브라우저 저장 모드에는 서버 권한 자체가 없습니다'); return; }
+    setVisBusy(true);
+    try {
+      let n = 0;
+      for (const coll of CONTENT_COLLECTIONS) {
+        const rows = await be.fetchList(coll);
+        const targets = rows.filter(r => visFloorOf(coll, r) !== 'public');
+        if (targets.length) n += await be.refreshVis(coll, targets, user?.id ?? null);
+      }
+      toast(n ? `글 ${n}건을 서버에서도 가렸습니다` : '비공개로 둔 메뉴에 글이 없습니다');
+    } catch (e) {
+      toast(e instanceof Error && e.message ? e.message : '적용하지 못했습니다');
+    }
+    setVisBusy(false);
+  };
   const revert = () => { setDraft(saved); setDraftRemoved(ms.removedBoards); };
 
   // 이탈 경고 — 미저장 변경이 있는데 상단바·다른 설정 탭으로 이동하려 하면 (테마와 동일 패턴)
@@ -1825,28 +2007,15 @@ function MenuPane() {
     setTimeout(() => el?.click(), 30);   // 보류했던 클릭 재실행 → 원래 목적지로
   };
 
-  // 트리 정규화(저장본 대상) — 사라진 기능(삭제된 게시판) 제거 + 새 게시판을 /board가 든 그룹에 자동 편입
+  /* 트리 정규화(저장본 대상) — 사라진 기능(삭제된 게시판) 제거.
+     **새로 만든 것을 자동으로 넣지는 않는다** (v2.0 사용자 확정) — 미배치에 머물게 둔다 */
   useEffect(() => {
     if (!msLoaded || !bLoaded) return;
     let next: MenuGroupNode[] = saved
       .map(g => (g.href
-        ? (menuLabelFor(g.href, boards) === null ? null : g)
-        : { ...g, items: g.items.filter(it => menuLabelFor(it.href, boards) !== null) }))
+        ? (menuLabelFor(g.href, extraAll) === null ? null : g)
+        : { ...g, items: g.items.filter(it => menuLabelFor(it.href, extraAll) !== null) }))
       .filter((g): g is MenuGroupNode => !!g);
-    const placed = new Set(next.flatMap(g => (g.href ? [g.href] : g.items.map(i => i.href))));
-    for (const b of boards) {
-      if (b.id === MAIN_BOARD_ID) continue;
-      const href = extraBoardHref(b.id);
-      if (placed.has(href) || ms.removedBoards.includes(href)) continue;
-      const hi = next.findIndex(g => !g.href && g.items.some(i => i.href === '/board'));
-      if (hi >= 0) {
-        const at = next[hi].items.findIndex(i => i.href === '/board');
-        next = next.map((g, i) => (i === hi
-          ? { ...g, items: [...g.items.slice(0, at + 1), { href }, ...g.items.slice(at + 1)] } : g));
-      } else {
-        next = [...next, { id: newGroupId(), label: b.name, href, items: [] }];
-      }
-    }
     if (JSON.stringify(next) !== JSON.stringify(saved)) patch({ tree: next });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msLoaded, bLoaded, boards, ms.tree]);
@@ -1855,16 +2024,19 @@ function MenuPane() {
   const placedSet = new Set(tree.flatMap(g => (g.href ? [g.href] : g.items.map(i => i.href))));
   const unplaced = [
     ...FEATURES.filter(f => !placedSet.has(f.href)),
-    ...boards.filter(b => b.id !== MAIN_BOARD_ID)
-      .map(b => ({ href: extraBoardHref(b.id), label: b.name }))
-      .filter(x => !placedSet.has(x.href)),
+    // 게시판·갤러리·다이어리 등 여러 개로 만든 것도 여기 뜬다 (v2.0 사용자 요청).
+    // 자동 배치를 없앴으므로 **만들면 여기 머문다** — 원하는 상위 메뉴에 직접 넣는다
+    ...extraAll.map(b => ({ href: b.href, label: b.name })).filter(x => !placedSet.has(x.href)),
   ];
 
   const patchGroup = (id: string, p: Partial<MenuGroupNode>) =>
     setTree(tree.map(g => (g.id === id ? { ...g, ...p } : g)));
   // 배치 해제 시 게시판이면 자동 편입 제외 목록에 (다시 배치하면 해제) — 드래프트에만
   const markRemoved = (hrefs: string[]) => {
-    const bs = hrefs.filter(h => h.startsWith('/board?b='));
+    // 추가 항목(게시판·섹션)은 빼 두면 자동 배치가 다시 넣지 않도록 기억한다 —
+    // 기억하지 않으면 빼는 순간 자동 배치가 원래 자리로 되돌려 놓는다
+    const known = new Set(extraAll.map(b => b.href));
+    const bs = hrefs.filter(h => known.has(h));
     if (bs.length) setDraftRemoved([...new Set([...removed, ...bs])]);
   };
   const removeGroup = (g: MenuGroupNode) => {
@@ -1909,7 +2081,7 @@ function MenuPane() {
   // 메뉴별 부속 설정 — 기본 탭용 (표시 방식 등)
   const extraFor = (href: string) => {
     switch (href) {
-      case '/backup': return (
+      case '/gallery': return (
         <div className="mini-seg">
           <button className={ms.backupView === 'gal' ? 'on' : ''} onClick={() => patch({ backupView: 'gal' })}>기본: 갤러리</button>
           <button className={ms.backupView === 'list' ? 'on' : ''} onClick={() => patch({ backupView: 'list' })}>기본: 리스트</button>
@@ -1965,7 +2137,7 @@ function MenuPane() {
         </>
       );
     }
-    if (href === '/roadview') {
+    if (href === '/loadb') {
       return (
         <>
           {permSel('업로드', ms.roadUpload, v => patch({ roadUpload: v }))}
@@ -2034,6 +2206,33 @@ function MenuPane() {
               ))}
             </div>
           ))}
+          {/* 글에도 적용 (v2.0 사용자 요청) — 공개범위를 서버까지 적용한다 */}
+          <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--line)' }}>
+            <b style={{ fontSize: 13 }}>열람 비공개 처리</b>
+            <div className="d" style={{ marginTop: 4, lineHeight: 1.7 }}>
+              위 공개범위는 <b>화면에서 가리는 것</b>이라, 주소나 API를 직접 부르면 글이 그대로 나옵니다.
+              이 버튼을 누르면 <b>이미 올라간 글의 공개범위를 서버에 적용</b>해 서버가 아예 내주지 않게 합니다
+              — 「비로그인 숨김」은 회원공개로, 「관리자만」은 비공개로.
+              <br />
+              <b>지금부터 쓰는 글은 누르지 않아도 그렇게 저장됩니다.</b>{' '}
+              <span style={{ color: 'var(--accent)' }}>좁히기만 하고 넓히지는 않습니다</span> —
+              나중에 다시 공개로 바꾸려면 각 글의 공개범위를 직접 되돌려야 합니다.
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+              <button className="btn btn-dark" disabled={visBusy || dirty}
+                onClick={() => setVisAsk(true)}>
+                {visBusy ? '적용 중…' : dirty ? 'SAVE 먼저' : '글에도 적용'}
+              </button>
+            </div>
+          </div>
+          <ConfirmModal open={visAsk} title="글 공개범위를 서버에 적용할까요?"
+            body={'비공개로 둔 메뉴의 글이 서버에서도 가려집니다. 각 글의 공개범위가 바뀌므로, 되돌리려면 글마다 직접 고쳐야 합니다.'}
+            onClose={() => setVisAsk(false)}
+            buttons={[
+              { label: 'CANCEL', kind: 'ghost', onClick: () => setVisAsk(false) },
+              { label: '적용', kind: 'dark', onClick: () => { setVisAsk(false); void applyVis(); } },
+            ]} />
+
           {/* 이미지 저장 방지 (v1.9) — 영역별 우클릭·드래그 차단, 관리자 제외 · 즉시 반영 */}
           <div style={{ marginTop: 18 }}>
             <b style={{ fontSize: 13 }}>이미지 저장 방지</b>
@@ -2254,8 +2453,16 @@ function ThreadPane() {
   const [settings, patch] = useThreadSettings();
   const [works] = useLocalList<ThreadWork>('ohome.threads.v1', THREAD_SEED);
   const del = useConfirmDelete();
+  /* 분류는 감상타래마다 따로 (v2.0 사용자 요청) — 여러 개로 만들었으면 어느 것의 분류를
+     고칠지 먼저 고른다. 하나뿐이면 고를 것이 없으니 선택 줄을 아예 두지 않는다. */
+  const { list } = useSections();
+  const secs = list('threads');
+  const [secId, setSecId] = useState(MAIN_SEC);
+  const cur = secs.find(s => s.id === secId) ? secId : MAIN_SEC;
+  const cats = threadCats(settings, cur);
+  const setCats = (next: ThreadCat[]) => patch(threadCatsPatch(settings, cur, next));
   const patchCat = (id: string, p: Partial<ThreadCat>) =>
-    patch({ cats: settings.cats.map(c => (c.id === id ? { ...c, ...p } : c)) });
+    setCats(cats.map(c => (c.id === id ? { ...c, ...p } : c)));
   return (
     <div className="set-sec">
       <h3>기본 보기</h3>
@@ -2271,8 +2478,18 @@ function ThreadPane() {
       </div>
 
       <h3 style={{ marginTop: 26 }}>분류 리스트</h3>
-      <div className="d">작품 분류 뱃지 — 이름 · 배경/테두리/글씨색 · ⠿ 드래그로 순서 · 추가/삭제</div>
-      <DragList items={settings.cats} keyOf={c => c.id} onReorder={cats => patch({ cats })}
+      <div className="d">
+        작품 분류 뱃지 — 이름 · 배경/테두리/글씨색 · ⠿ 드래그로 순서 · 추가/삭제
+        {secs.length > 1 && <><br />감상타래마다 따로 정합니다 — <b>손대기 전까지는 기본 감상타래의 분류를 그대로 씁니다</b></>}
+      </div>
+      {secs.length > 1 && (
+        <div className="mini-seg" style={{ flexWrap: 'wrap', marginBottom: 10 }}>
+          {secs.map(s => (
+            <button key={s.id} className={cur === s.id ? 'on' : ''} onClick={() => setSecId(s.id)}>{s.name}</button>
+          ))}
+        </div>
+      )}
+      <DragList items={cats} keyOf={c => c.id} onReorder={next => setCats(next)}
         render={c => (
           <div className="set-row" style={{ width: '100%' }}>
             <div className="l" style={{ display: 'flex', gap: 11, alignItems: 'center' }}>
@@ -2290,9 +2507,9 @@ function ThreadPane() {
               <ColorField value={c.fg ?? '#ffffff'} onChange={hex => patchCat(c.id, { fg: hex })} />
               <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
                 onClick={() => {
-                  const used = works.filter(w => w.catId === c.id).length;
+                  const used = works.filter(w => w.catId === c.id && inSection(w.secId, cur)).length;
                   del.ask(`분류 「${c.label}」를 삭제하시겠습니까?`,
-                    () => patch({ cats: settings.cats.filter(x => x.id !== c.id) }),
+                    () => setCats(cats.filter(x => x.id !== c.id)),
                     used > 0 ? `이 분류의 타래 ${used}개는 유지되지만 분류가 「기타」로 표시됩니다.` : undefined);
                 }}>DELETE</button>
             </div>
@@ -2300,7 +2517,7 @@ function ThreadPane() {
         )} />
       <div style={{ marginTop: 10, display: 'flex', justifyContent: 'flex-end' }}>
         <button className="btn btn-ghost" style={{ padding: '5px 12px', fontSize: 11 }}
-          onClick={() => patch({ cats: [...settings.cats, { id: newId(), label: '새 분류' }] })}>
+          onClick={() => setCats([...cats, { id: newId(), label: '새 분류' }])}>
           ＋ ADD
         </button>
       </div>
@@ -2553,7 +2770,7 @@ function BgmPane() {
 
 /** 폰트 목록 한 줄 — CSS URL 표시 · 수정(이름/family/URL, 업로드 폰트는 이름/한글 페어) · 삭제 */
 function FontRow({ f }: { f: FontDef }) {
-  const { fonts, updateFont, removeFont, setFontPair } = useFonts();
+  const { fonts, familyOf, updateFont, removeFont, resetFont, setFontPair } = useFonts();
   const del = useConfirmDelete();
   const toast = useToast();
   const [editing, setEditing] = useState(false);
@@ -2594,6 +2811,16 @@ function FontRow({ f }: { f: FontDef }) {
               if (updateFont(f.id, { name, family: f.fileId ? f.family : family, cssUrl: f.fileId ? '' : cssUrl })) { setEditing(false); toast('폰트가 수정되었습니다'); }
               else toast('이름과 font-family 값을 입력해 주세요');
             }}>SAVE</button>
+          {/* 내장 폰트를 처음 상태로 (v2.0 사용자 발견) — 이름·family·한글 페어를 한꺼번에 되돌린다.
+              잘못 들어간 값(엉뚱한 family, 지워진 폰트를 가리키는 페어)을 풀 방법이 없었다 */}
+          {f.builtin && (
+            <button className="btn btn-ghost" style={{ whiteSpace: 'nowrap' }}
+              onClick={() => {
+                resetFont(f.id);
+                setEditing(false);
+                toast(`「${f.name}」를 처음 상태로 되돌렸습니다`);
+              }}>기본값으로</button>
+          )}
           <button className="btn btn-ghost" style={{ whiteSpace: 'nowrap' }}
             onClick={() => { setEditing(false); setName(f.name); setFamily(f.family); setCssUrl(fontCssUrl(f) ?? ''); }}>CANCEL</button>
         </div>
@@ -2605,7 +2832,8 @@ function FontRow({ f }: { f: FontDef }) {
     <div className="set-row">
       <div className="l" style={{ minWidth: 0 }}>
         {/* 미리보기는 페어 반영 스택 — 영문 폰트+한글 페어면 한글이 페어 폰트로 보임 (v1.9) */}
-        <b style={{ fontFamily: f.pairId ? `${f.family}, ${fonts.find(x => x.id === f.pairId)?.family ?? ''}` : f.family, fontSize: 15 }}>{f.name} — 가나다 ABC 123</b>
+        {/* familyOf가 페어까지 합쳐 주고 var(--serif) 같은 별칭도 원본 스택으로 풀어 준다 (v2.0) */}
+        <b style={{ fontFamily: familyOf(f.id), fontSize: 15 }}>{f.name} — 가나다 ABC 123</b>
         <small style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {f.fileId
             ? `업로드 파일 — ${f.fileName ?? '폰트 파일'}${f.pairId ? ` · 한글 페어: ${fonts.find(x => x.id === f.pairId)?.name ?? ''}` : ''}`
@@ -2618,7 +2846,10 @@ function FontRow({ f }: { f: FontDef }) {
         {!f.locked && (
           <button className="btn btn-ghost" style={{ padding: '4px 10px', fontSize: 10.5 }}
             onClick={() => del.ask(`폰트 「${f.name}」를 삭제하시겠습니까?`, () => removeFont(f.id),
-                f.builtin ? '기본 폰트는 아래 [복원] 버튼으로 되살릴 수 있습니다.' : '직접 등록한 폰트는 복구할 수 없습니다. 이 폰트를 쓰던 항목 표시는 유지됩니다.')}>DELETE</button>
+                f.builtin
+                  ? '기본 폰트는 목록에서만 빠집니다 — 아래 [복원] 버튼으로 되살릴 수 있고, 이 폰트를 쓰던 항목 표시는 그대로입니다.'
+                  // 직접 등록한 폰트는 정의째 사라지므로 가리키던 자리도 함께 정리된다 (v2.0)
+                  : '직접 등록한 폰트는 복구할 수 없습니다. 이 폰트를 쓰도록 지정해 둔 자리(역할 폰트·한글 페어)는 기본값으로 되돌아갑니다.')}>DELETE</button>
         )}
       </div>
       {del.element}
@@ -2733,8 +2964,17 @@ function SettingsInner() {
     return () => mq.removeEventListener('change', f);
   }, []);
 
-  // 테마 미리보기는 이 페이지 안에서만 — SAVE 없이 벗어나면 저장본으로 원복 (v1.9)
-  const { dirty, discard, save } = useTheme();
+  /* 미리보기는 이 페이지 안에서만 — SAVE 없이 벗어나면 저장본으로 원복 (v1.9).
+     **색만 지키고 있었다** (v2.0 사용자 발견 — 「폰트 바꾸고 SAVE 안 했는데 화면 전환이 되고
+     적용돼 있어」). 디자인 탭의 SAVE는 색·역할 폰트·로고/탭 제목 **셋**을 함께 저장하는데,
+     이탈 경고와 원복은 색(useTheme)만 보고 있었다. 나머지 둘은 모듈·프로바이더에 사는
+     드래프트라 페이지를 떠나도 사라지지 않아, 저장한 것처럼 계속 적용된 채로 남았다. */
+  const { dirty: themeDirty, discard: themeDiscard, save: themeSave } = useTheme();
+  const { rolesDirty, saveRoles, discardRoles } = useFonts();
+  const siteDraft = useSiteDraft();
+  const dirty = themeDirty || rolesDirty || siteDraft.dirty;
+  const save = () => { themeSave(); saveRoles(); siteDraft.save(); };
+  const discard = () => { themeDiscard(); discardRoles(); siteDraft.discard(); };
   const themeRef = useRef({ dirty, discard });
   themeRef.current = { dirty, discard };
   useEffect(() => () => { if (themeRef.current.dirty) themeRef.current.discard(); }, []);
